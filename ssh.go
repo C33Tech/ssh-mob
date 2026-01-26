@@ -141,10 +141,13 @@ func (a *Agent) RunTTYProgram() error {
 		command := a.getCommand(idx)
 
 		log.Debug("Running", "CMD", command)
-
+		log.Debug("Writing command to stdin...")
 		if _, err := stdin.Write([]byte(command + "\r")); err != nil {
+			log.Error("Failed to write command to stdin: ", err)
 			return err
 		}
+
+		log.Debug("Sleeping", "duration", a.getSleepDuration())
 
 		time.Sleep(a.getSleepDuration())
 		idx++
@@ -186,6 +189,7 @@ func (a *Agent) RunStandardProgram() error {
 		log.Debug("Running", "CMD", command)
 		out, err := sess.Output(command)
 		if err != nil {
+			log.Error("Failed to run command: ", err)
 			sess.Close()
 			a.Close()
 			return err
