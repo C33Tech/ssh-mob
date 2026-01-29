@@ -53,6 +53,8 @@ The codebase consists of two files with clear separation:
 - Agents are isolated - connection failures don't affect other agents
 - Rate limiting: `-rate N` means N commands/minute (sleep = 60/N seconds between commands)
 - TTL enforcement: Each agent tracks elapsed time and closes after `-ttl` seconds
+- Connection retries: `-retries N` attempts with exponential backoff (1s, 2s, 4s... capped at 16s)
+- Graceful shutdown: First Ctrl+C finishes current command then exits, second Ctrl+C forces immediate exit
 - Host key verification is disabled (`ssh.InsecureIgnoreHostKey()`) - intended for testing environments only
 
 ## Dependencies

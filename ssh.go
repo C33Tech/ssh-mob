@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"time"
 
@@ -22,18 +23,23 @@ type Agent struct {
 	ConnectionStart time.Time
 	CommandRate     int
 	CommandScript   []string
+	MaxRetries      int
 }
 
-func (a *Agent) Connect() {
+func (a *Agent) Connect(ctx context.Context) error {
 	if a.Connection != nil {
-		return
+		return nil
 	}
 
+	// Apply connection delay only on first attempt (context-aware)
 	if a.ConnectionDelay > 0 {
-		time.Sleep(time.Duration(a.ConnectionDelay) * time.Second)
+		select {
+		case <-time.After(time.Duration(a.ConnectionDelay) * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	// Connect to the SSH server
 	config := ssh.ClientConfig{
 		User: a.Username,
 		Auth: []ssh.AuthMethod{
@@ -42,31 +48,62 @@ func (a *Agent) Connect() {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", a.Host, a.Port), &config)
-	if err != nil {
-		log.Error("Failed to dial: ", err)
-		return
+	var lastErr error
+	maxAttempts := a.MaxRetries + 1 // MaxRetries=0 means 1 attempt
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Check for cancellation before each attempt
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", a.Host, a.Port), &config)
+		if err == nil {
+			a.ConnectionStart = time.Now()
+			a.Connection = conn
+			log.Debug("Connected to SSH server.", "time", time.Now(), "host", a.Host, "port", a.Port)
+			return nil
+		}
+
+		lastErr = err
+
+		// If we have retries left, log and backoff
+		if attempt < maxAttempts-1 {
+			backoff := a.getBackoffDuration(attempt)
+			log.Warn("Connection failed, retrying...", "attempt", attempt+1, "backoff", backoff, "error", err)
+
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 
-	a.ConnectionStart = time.Now()
-	a.Connection = conn
-
-	log.Debug("Connected to SSH server.", "time", time.Now(), "host", a.Host, "port", a.Port)
-
-	if a.UseTTY {
-
-	}
+	log.Error("Connection failed after retries", "attempts", maxAttempts, "error", lastErr)
+	return lastErr
 }
 
-func (a *Agent) RunProgram() error {
-	if a.UseTTY {
-		return a.RunTTYProgram()
+func (a *Agent) getBackoffDuration(attempt int) time.Duration {
+	// Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped)
+	backoff := time.Duration(1<<attempt) * time.Second
+	if backoff > 16*time.Second {
+		backoff = 16 * time.Second
 	}
-
-	return a.RunStandardProgram()
+	return backoff
 }
 
-func (a *Agent) RunTTYProgram() error {
+func (a *Agent) RunProgram(ctx context.Context) error {
+	if a.UseTTY {
+		return a.RunTTYProgram(ctx)
+	}
+
+	return a.RunStandardProgram(ctx)
+}
+
+func (a *Agent) RunTTYProgram(ctx context.Context) error {
 	if a.Connection == nil {
 		return fmt.Errorf("Connection is nil")
 	}
@@ -129,10 +166,22 @@ func (a *Agent) RunTTYProgram() error {
 	}
 
 	log.Debug("Waiting for shell to start...")
-	time.Sleep(time.Second * 10) // Wait for the shell to start
+	select {
+	case <-time.After(time.Second * 10):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	idx := 0
 	for {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			log.Info("Context cancelled. Closing agent...")
+			return nil
+		default:
+		}
+
 		if a.ConnectionStart.Add(time.Duration(a.ConnectionTTL) * time.Second).Before(time.Now()) {
 			log.Info("Connection TTL reached. Closing agent...")
 			return nil
@@ -149,18 +198,31 @@ func (a *Agent) RunTTYProgram() error {
 
 		log.Debug("Sleeping", "duration", a.getSleepDuration())
 
-		time.Sleep(a.getSleepDuration())
+		// Context-aware sleep
+		select {
+		case <-time.After(a.getSleepDuration()):
+		case <-ctx.Done():
+			return nil
+		}
 		idx++
 	}
 }
 
-func (a *Agent) RunStandardProgram() error {
+func (a *Agent) RunStandardProgram(ctx context.Context) error {
 	if a.Connection == nil {
 		return fmt.Errorf("Connection is nil")
 	}
 
 	idx := 0
 	for {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			log.Info("Context cancelled. Closing agent...")
+			return nil
+		default:
+		}
+
 		if a.ConnectionStart.Add(time.Duration(a.ConnectionTTL) * time.Second).Before(time.Now()) {
 			log.Info("Connection TTL reached. Closing agent...")
 			return nil
@@ -172,8 +234,6 @@ func (a *Agent) RunStandardProgram() error {
 		if err != nil {
 			return err
 		}
-
-		defer sess.Close()
 
 		modes := ssh.TerminalModes{
 			ssh.TTY_OP_ISPEED: 14400, // input speed = 14.4kbaud
@@ -198,7 +258,12 @@ func (a *Agent) RunStandardProgram() error {
 		log.Info(string(out))
 		sess.Close()
 
-		time.Sleep(a.getSleepDuration())
+		// Context-aware sleep
+		select {
+		case <-time.After(a.getSleepDuration()):
+		case <-ctx.Done():
+			return nil
+		}
 		idx++
 	}
 }

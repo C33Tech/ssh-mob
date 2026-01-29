@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/log"
@@ -24,6 +27,7 @@ func main() {
 	useTTY := flag.Bool("tty", false, "Use TTY for the connection")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	script := flag.String("script", "", "Script to run on the remote host. If a file path is provided, the contents will be used.")
+	retries := flag.Int("retries", 0, "Maximum connection retry attempts")
 	flag.Parse()
 
 	// If any required fields are missing, prompt the user for them
@@ -83,6 +87,23 @@ func main() {
 	log.SetLevel(translateLogLevel(*logLevel))
 	log.Info("Starting SSH Mob...", "host", *host, "port", *port, "username", *username, "count", *count, "ttl", *ttl)
 
+	// Setup context with signal handling for graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Handle second signal for force exit
+	go func() {
+		<-ctx.Done() // First signal received
+		log.Warn("Shutting down gracefully... (press Ctrl+C again to force)")
+
+		// Setup second signal listener
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan // Second signal
+		log.Warn("Forcing exit...")
+		os.Exit(1)
+	}()
+
 	// Create the requested number of agents and connect them asynchronously
 	var wg sync.WaitGroup
 	agents := make([]*Agent, *count)
@@ -115,6 +136,7 @@ func main() {
 			UseTTY:          *useTTY,
 			CommandRate:     *rate,
 			CommandScript:   commandScript,
+			MaxRetries:      *retries,
 		}
 
 		wg.Add(1)
@@ -122,10 +144,12 @@ func main() {
 		log.Debug(fmt.Sprintf("Starting agent #%d", i+1))
 		go func(a *Agent, agentNum int) {
 			defer wg.Done()
-			a.Connect()
+			if err := a.Connect(ctx); err != nil {
+				return // Already logged in Connect()
+			}
 
 			log.Debug(fmt.Sprintf("Agent #%d connected. Starting command loop...", agentNum))
-			a.RunProgram()
+			a.RunProgram(ctx)
 			a.Close()
 		}(agents[i], i+1)
 	}
