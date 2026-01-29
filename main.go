@@ -120,14 +120,14 @@ func main() {
 		wg.Add(1)
 
 		log.Debug(fmt.Sprintf("Starting agent #%d", i+1))
-		go func(a *Agent) {
+		go func(a *Agent, agentNum int) {
 			defer wg.Done()
-			agents[i].Connect()
+			a.Connect()
 
-			log.Debug(fmt.Sprintf("Agent #%d connected. Starting command loop...", i+1))
-			agents[i].RunProgram()
+			log.Debug(fmt.Sprintf("Agent #%d connected. Starting command loop...", agentNum))
+			a.RunProgram()
 			a.Close()
-		}(agents[i])
+		}(agents[i], i+1)
 	}
 
 	// Wait for all agents to finish
